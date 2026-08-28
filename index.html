@@ -213,7 +213,7 @@ textarea.note-input{
   <!-- ===================== 라이브러리 ===================== -->
   <section id="screen-library" class="screen active">
     <div class="lib-header">
-      <div class="lib-title">서재<small id="libSub">0권 · 둘이 함께 보는 책장</small></div>
+      <div class="lib-title">서재<small id="libSub">0권 ·  책장</small></div>
       <div style="display:flex; gap:6px;">
         <button class="lib-add" id="btnSetupGear" style="background:var(--bg-elev2); color:var(--ink); font-size:15px;">⚙</button>
         <button class="lib-add" id="btnRefreshLib" style="background:var(--bg-elev2); color:var(--ink); font-size:17px;">⟳</button>
@@ -223,7 +223,7 @@ textarea.note-input{
     <div class="lib-scroll" id="libScroll">
       <div class="lib-empty" id="libEmpty">
         <div class="ico">📖</div>
-        <p>오른쪽 위 ＋ 버튼으로<br>PDF를 추가하면 여기에 책장이 생겨요.<br><span style="font-size:12px">책 목록은 둘이 공유돼요 · ⟳로 새로고침</span></p>
+        <p>오른쪽 위 ＋ 버튼으로<br>PDF를 추가하면 여기에 책장이 생겨요.<br><span style="font-size:12px">책 목록은 공유돼요 · ⟳로 새로고침</span></p>
       </div>
       <div id="libList"></div>
     </div>
@@ -389,6 +389,21 @@ async function remoteGet(key) {
     return JSON.parse(data.value);
   } catch (e) { console.error('remoteGet 실패', key, e); return null; }
 }
+async function remoteGetMany(keys) {
+  const api = getApiUrl();
+  if (!api || !keys.length) return {};
+  try {
+    const res = await fetch(`${api}?action=getMany&keys=${encodeURIComponent(keys.join(','))}`);
+    const data = await res.json();
+    if (!data.ok) return {};
+    const out = {};
+    for (const k of keys) {
+      const raw = data.values ? data.values[k] : null;
+      out[k] = raw ? JSON.parse(raw) : null;
+    }
+    return out;
+  } catch (e) { console.error('remoteGetMany 실패', e); return {}; }
+}
 async function remoteSet(key, value) {
   const api = getApiUrl();
   if (!api) return false;
@@ -401,6 +416,19 @@ async function remoteSet(key, value) {
     const data = await res.json();
     return !!data.ok;
   } catch (e) { console.error('remoteSet 실패', key, e); return false; }
+}
+async function remoteSetMany(items) {
+  const api = getApiUrl();
+  if (!api || !items.length) return false;
+  try {
+    const res = await fetch(api, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action: 'setMany', items })
+    });
+    const data = await res.json();
+    return !!data.ok;
+  } catch (e) { console.error('remoteSetMany 실패', e); return false; }
 }
 async function remoteDelete(key) {
   const api = getApiUrl();
@@ -618,22 +646,28 @@ async function importPdfFile(file) {
 
     const chunks = [];
     for (let i = 0; i < merged.length; i += CHUNK_SIZE) chunks.push(merged.slice(i, i + CHUNK_SIZE));
-    for (let c = 0; c < chunks.length; c++) {
-      progressEl.textContent = `책장에 올리는 중… (${c + 1}/${chunks.length})`;
-      const ok = await remoteSet(`blocks:${bookId}:${c}`, chunks[c]);
-      if (!ok) throw new Error('청크 저장 실패');
-    }
 
     const title = file.name.replace(/\.pdf$/i, '');
     const cover = COVER_COLORS[Math.floor(Math.random() * COVER_COLORS.length)];
     const book = { id: bookId, title, totalPages: numPages, totalChars, cover, chunkCount: chunks.length, createdAt: Date.now() };
 
+    progressEl.textContent = `책장에 올리는 중…`;
     const lib = await getLibrary();
     lib.books.unshift(book);
-    const ok = await saveLibrary(lib);
-    if (!ok) throw new Error('서재 목록 저장 실패');
+
+    const items = [{ key: 'library', value: lib }];
+    chunks.forEach((chunk, c) => items.push({ key: `blocks:${bookId}:${c}`, value: chunk }));
+
+    // 너무 큰 책은 여러 번에 나눠 업로드(요청 하나가 너무 커지지 않게)
+    const BATCH = 6;
+    for (let i = 0; i < items.length; i += BATCH) {
+      progressEl.textContent = `책장에 올리는 중… (${Math.min(i + BATCH, items.length)}/${items.length})`;
+      const ok = await remoteSetMany(items.slice(i, i + BATCH));
+      if (!ok) throw new Error('저장 실패');
+    }
 
     localSet(`progress:${bookId}`, { blockIndex: 0, charsUpTo: 0, updatedAt: Date.now() });
+    localSet(`cache_blocks_${bookId}`, merged); // 방금 만든 책은 바로 캐싱해서 재진입 시 즉시 열림
 
     overlay.classList.remove('show');
     await renderLibrary();
@@ -712,6 +746,7 @@ function showCtxMenu(bookId, card) {
       localDelete(`highlights:${bookId}`);
       localDelete(`bookmarks:${bookId}`);
       localDelete(`progress:${bookId}`);
+      localDelete(`cache_blocks_${bookId}`);
       menu.classList.remove('show');
       renderLibrary();
       toast('삭제했어요');
@@ -735,10 +770,16 @@ async function openBook(bookId) {
   if (!currentBook) { overlay.classList.remove('show'); toast('책을 찾을 수 없어요'); renderLibrary(); return; }
 
   currentBlocks = [];
-  for (let c = 0; c < currentBook.chunkCount; c++) {
-    progressEl.textContent = `불러오는 중… (${c + 1}/${currentBook.chunkCount})`;
-    const chunk = await remoteGet(`blocks:${bookId}:${c}`);
-    if (chunk) currentBlocks.push(...chunk);
+  const cached = localGet(`cache_blocks_${bookId}`);
+  if (cached && cached.length) {
+    currentBlocks = cached;
+  } else {
+    const keys = [];
+    for (let c = 0; c < currentBook.chunkCount; c++) keys.push(`blocks:${bookId}:${c}`);
+    progressEl.textContent = `책 내용을 불러오는 중…`;
+    const values = await remoteGetMany(keys);
+    for (const k of keys) { if (values[k]) currentBlocks.push(...values[k]); }
+    if (currentBlocks.length) localSet(`cache_blocks_${bookId}`, currentBlocks);
   }
   currentHighlights = localGet(`highlights:${bookId}`) || [];
   currentBookmarks = localGet(`bookmarks:${bookId}`) || [];
