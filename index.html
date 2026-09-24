@@ -86,6 +86,13 @@ button{font-family:inherit; border:none; background:none; color:inherit; cursor:
 .block.heading .page-tag{display:block; font-family:var(--font-mono); font-size:10.5px; color:var(--accent); font-weight:500; letter-spacing:1.5px; margin-bottom:6px;}
 .block.para{scroll-margin-top:70px;}
 .block.image-block{scroll-margin-top:70px; margin:1.2em 0;}
+.block.table-block{scroll-margin-top:70px; margin:1.2em 0; font-size:calc(var(--reader-size) - 2px); line-height:1.6;}
+.table-scroll{overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--rule); border-radius:8px; background:var(--bg-elev);}
+.table-scroll table{border-collapse:collapse; min-width:100%;}
+.table-scroll td,.table-scroll th{border:1px solid var(--rule); padding:10px 12px; vertical-align:top; min-width:90px; word-break:keep-all;}
+.table-scroll p{margin:0 0 .4em;} .table-scroll p:last-child{margin-bottom:0;}
+.table-scroll ol,.table-scroll ul{margin:0 0 .4em; padding-left:1.3em;}
+.table-scroll img{max-width:100%;}
 .block.image-block img{width:100%; border-radius:8px; display:block; box-shadow:0 4px 16px var(--shadow); -webkit-user-select:none; user-select:none;}
 .block-note{
   margin-top:.6em; padding:10px 12px; background:var(--bg-elev2); border-left:3px solid var(--accent);
@@ -227,7 +234,7 @@ textarea.note-input{
       </div>
       <div id="libList"></div>
     </div>
-    <input type="file" id="fileInput" accept="application/pdf" style="display:none">
+    <input type="file" id="fileInput" accept="application/pdf,.pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" style="display:none">
   </section>
 
   <!-- ===================== 리더 ===================== -->
@@ -362,6 +369,7 @@ textarea.note-input{
 <div class="toast" id="toast"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
 <script>
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 </script>
@@ -544,6 +552,218 @@ async function saveLibrary(lib) { return remoteSet('library', lib); }
 /* =========================================================
    PDF 임포트 파이프라인
    ========================================================= */
+/* =========================================================
+   워드(.docx) → 리더 블록 변환
+   - 제목 스타일 → heading
+   - 문단 → para (하이라이트·검색 가능)
+   - 그림 → 원래 자리에 image 블록
+   - 표 → table 블록 (원본 표 그대로, 좌우 스크롤)
+   ========================================================= */
+const DOCX_CHARS_PER_PAGE = 800;
+
+function fixBrokenGlyphs(s) {
+  // PDF→워드 변환 과정에서 '우'가 '❹'로 깨지는 경우 복구 (한글 바로 옆에 붙은 것만)
+  return s.replace(/([가-힣])❹|❹(?=[가-힣])/g, (m, a) => (a ? a + '우' : '우'));
+}
+function cleanText(s) {
+  return fixBrokenGlyphs(s).replace(/\u00a0/g, ' ').replace(/[ \t\r\n]+/g, ' ').trim();
+}
+
+async function docxToBlocks(mammothInput, compressImage, onProgress) {
+  const result = await mammoth.convertToHtml(mammothInput, {
+    styleMap: [
+      "p[style-name='Title'] => h1:fresh",
+      "p[style-name='Heading 1'] => h1:fresh",
+      "p[style-name='Heading 2'] => h2:fresh",
+      "p[style-name='Heading 3'] => h3:fresh"
+    ],
+    convertImage: mammoth.images.imgElement(img =>
+      img.read('base64').then(b64 => ({ src: `data:${img.contentType};base64,${b64}` })))
+  });
+
+  const doc = new DOMParser().parseFromString(`<div id="docx-root">${result.value}</div>`, 'text/html');
+  const root = doc.getElementById('docx-root');
+  const blocks = [];
+  const imgTotal = root.querySelectorAll('img').length;
+  let imgDone = 0;
+
+  async function pushImage(imgEl) {
+    const src = imgEl.getAttribute('src');
+    if (!src) return;
+    imgDone++;
+    if (onProgress) onProgress(`그림 정리 중… (${imgDone}/${imgTotal})`);
+    const small = await compressImage(src);
+    blocks.push({ type: 'image', src: small, charCount: 130 });
+  }
+  function pushText(text, forceHeading) {
+    const t = cleanText(text);
+    if (!t) return;
+    const isHeading = forceHeading || /^#/.test(t);
+    const body = t.replace(/^#+\s*/, '').trim();
+    if (!body) return;
+    blocks.push({ type: isHeading ? 'heading' : 'para', text: body, charCount: body.length });
+  }
+
+  // 문단 안의 글자와 그림을 순서대로 꺼냄
+  async function walkInline(el, forceHeading) {
+    let buf = '';
+    const walk = async (node) => {
+      for (const ch of Array.from(node.childNodes)) {
+        if (ch.nodeType === 3) buf += ch.nodeValue;
+        else if (ch.nodeName === 'IMG') { pushText(buf, forceHeading); buf = ''; await pushImage(ch); }
+        else if (ch.nodeName === 'BR') buf += ' ';
+        else await walk(ch);
+      }
+    };
+    await walk(el);
+    pushText(buf, forceHeading);
+  }
+
+  async function walkList(listEl, depth) {
+    let n = 0;
+    for (const li of Array.from(listEl.children)) {
+      if (li.nodeName !== 'LI') continue;
+      n++;
+      const marker = listEl.nodeName === 'OL' ? `${n}. ` : '• ';
+      const nested = Array.from(li.children).filter(c => c.nodeName === 'UL' || c.nodeName === 'OL');
+      nested.forEach(c => c.remove());
+      const indent = '  '.repeat(depth);
+      const imgs = Array.from(li.querySelectorAll('img'));
+      imgs.forEach(i => i.remove());
+      const t = cleanText(li.textContent);
+      if (t) blocks.push({ type: 'para', text: indent + marker + t, charCount: t.length, list: true });
+      for (const i of imgs) await pushImage(i);
+      for (const c of nested) await walkList(c, depth + 1);
+    }
+  }
+
+  async function handleTable(tbl) {
+    for (const img of Array.from(tbl.querySelectorAll('img'))) {
+      imgDone++;
+      if (onProgress) onProgress(`그림 정리 중… (${imgDone}/${imgTotal})`);
+      img.setAttribute('src', await compressImage(img.getAttribute('src')));
+    }
+    tbl.querySelectorAll('*').forEach(e => {
+      for (const a of Array.from(e.attributes)) {
+        if (!['colspan', 'rowspan', 'src'].includes(a.name)) e.removeAttribute(a.name);
+      }
+    });
+    tbl.querySelectorAll('p').forEach(p => { p.textContent = fixBrokenGlyphs(p.textContent); });
+    const text = cleanText(tbl.textContent);
+    blocks.push({ type: 'table', html: `<table>${tbl.innerHTML}</table>`, text, charCount: Math.max(text.length, 60) });
+  }
+
+  for (const el of Array.from(root.children)) {
+    const tag = el.nodeName;
+    if (/^H[1-6]$/.test(tag)) await walkInline(el, true);
+    else if (tag === 'TABLE') await handleTable(el);
+    else if (tag === 'UL' || tag === 'OL') await walkList(el, 0);
+    else {
+      // 제목 바로 뒤의 짧은 굵은 글씨 문단은 제목의 둘째 줄로 붙임
+      const prev = blocks[blocks.length - 1];
+      const strongOnly = el.nodeName === 'P' && el.querySelector('img') === null &&
+        el.children.length > 0 && Array.from(el.childNodes).every(n =>
+          (n.nodeType === 3 && !n.nodeValue.trim()) || n.nodeName === 'STRONG');
+      const t = cleanText(el.textContent);
+      if (prev && prev.type === 'heading' && !prev.joined && strongOnly && t.length <= 40 && !/^#/.test(t)) {
+        prev.text += ' ' + t; prev.charCount = prev.text.length; prev.joined = true;
+        continue;
+      }
+      await walkInline(el, false);
+    }
+  }
+
+  // 페이지 경계에서 잘린 문단 이어붙이기 (문장이 끝나지 않은 긴 문단만)
+  const merged = [];
+  for (const b of blocks) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.type === 'para' && b.type === 'para' && !prev.list && !b.list &&
+      prev.text.length > 60 &&
+      !/[.!?"”')\]』」:]$/.test(prev.text) && !/^["“『「(\[•]/.test(b.text)) {
+      prev.text += ' ' + b.text; prev.charCount = prev.text.length;
+    } else merged.push({ ...b });
+  }
+
+  // 워드에는 쪽 개념이 없어서 글자 수 기준으로 가상 쪽수를 매김
+  let acc = 0;
+  merged.forEach((b, i) => {
+    b.idx = i;
+    b.page = Math.floor(acc / DOCX_CHARS_PER_PAGE) + 1;
+    acc += b.charCount;
+  });
+  const totalChars = acc;
+  const totalPages = Math.max(1, Math.ceil(acc / DOCX_CHARS_PER_PAGE));
+  return { blocks: merged, totalChars, totalPages };
+}
+
+
+/* ---------- 그림 용량 줄이기 (폭 1200px, JPEG) ---------- */
+function compressImage(src) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const maxW = 1200;
+      const approxBytes = src.length * 0.75;
+      if (img.width <= maxW && approxBytes < 180000) { resolve(src); return; }
+      const scale = Math.min(1, maxW / img.width);
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height);
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      resolve(c.toDataURL('image/jpeg', 0.82));
+    };
+    img.onerror = () => resolve(src);
+    img.src = src;
+  });
+}
+
+async function importDocxFile(file) {
+  if (!getApiUrl()) { toast('먼저 ⚙에서 서재를 연결해주세요'); showSetupScreen(); return; }
+  const overlay = document.getElementById('importOverlay');
+  const progressEl = document.getElementById('importProgress');
+  overlay.querySelector('.title').textContent = '워드 파일을 읽는 중이에요';
+  progressEl.textContent = '문서 구조 분석 중…';
+  overlay.classList.add('show');
+  try {
+    const buf = await file.arrayBuffer();
+    const { blocks: merged, totalChars, totalPages } = await docxToBlocks({ arrayBuffer: buf }, compressImage, (m) => { progressEl.textContent = m; });
+    if (!merged.length) throw new Error('내용 없음');
+
+    const bookId = uid();
+    const chunks = [];
+    for (let i = 0; i < merged.length; i += CHUNK_SIZE) chunks.push(merged.slice(i, i + CHUNK_SIZE));
+    const title = file.name.replace(/\.docx$/i, '');
+    const cover = COVER_COLORS[Math.floor(Math.random() * COVER_COLORS.length)];
+    const book = { id: bookId, title, totalPages, totalChars, cover, chunkCount: chunks.length, createdAt: Date.now(), source: 'docx' };
+
+    progressEl.textContent = '책장에 올리는 중…';
+    const lib = await getLibrary();
+    lib.books.unshift(book);
+    const items = [{ key: 'library', value: lib }];
+    chunks.forEach((chunk, c) => items.push({ key: `blocks:${bookId}:${c}`, value: chunk }));
+    const BATCH = 6;
+    for (let i = 0; i < items.length; i += BATCH) {
+      progressEl.textContent = `책장에 올리는 중… (${Math.min(i + BATCH, items.length)}/${items.length})`;
+      const ok = await remoteSetMany(items.slice(i, i + BATCH));
+      if (!ok) throw new Error('저장 실패');
+    }
+    localSet(`progress:${bookId}`, { blockIndex: 0, charsUpTo: 0, updatedAt: Date.now() });
+    localSet(`cache_blocks_${bookId}`, merged);
+
+    overlay.classList.remove('show');
+    overlay.querySelector('.title').textContent = 'PDF를 읽는 중이에요';
+    await renderLibrary();
+    toast('책장에 담았어요 (상대방에게도 보여요)');
+    openBook(bookId);
+  } catch (err) {
+    console.error(err);
+    overlay.classList.remove('show');
+    overlay.querySelector('.title').textContent = 'PDF를 읽는 중이에요';
+    toast('워드 파일을 저장하는 중 문제가 생겼어요');
+  }
+}
+
 async function importPdfFile(file) {
   if (!getApiUrl()) { toast('먼저 ⚙에서 서재를 연결해주세요'); showSetupScreen(); return; }
   const overlay = document.getElementById('importOverlay');
@@ -839,6 +1059,9 @@ async function openBook(bookId) {
 }
 
 function blockHtml(b) {
+  if (b.type === 'table') {
+    return `<div class="block table-block" data-idx="${b.idx}" data-page="${b.page}"><div class="table-scroll">${b.html}</div></div>`;
+  }
   if (b.type === 'image') {
     return `<div class="block image-block" data-idx="${b.idx}" data-page="${b.page}">
       <img src="${b.src}" alt="이미지 페이지">
@@ -975,7 +1198,7 @@ function getSelectionInfo() {
   const blockEl = range.commonAncestorContainer.nodeType === 1
     ? range.commonAncestorContainer.closest('.block')
     : range.commonAncestorContainer.parentElement.closest('.block');
-  if (!blockEl || blockEl.classList.contains('image-block')) return null;
+  if (!blockEl || blockEl.classList.contains('image-block') || blockEl.classList.contains('table-block')) return null;
   const idx = parseInt(blockEl.dataset.idx, 10);
   const block = currentBlocks.find(b => b.idx === idx);
   if (!block) return null;
@@ -1055,7 +1278,7 @@ function bindSelectionToolbar() {
 function rerenderBlock(idx) {
   const el = document.querySelector(`#readerInner [data-idx="${idx}"]`);
   const block = currentBlocks.find(b => b.idx === idx);
-  if (!el || !block || block.type === 'image') return;
+  if (!el || !block || block.type === 'image' || block.type === 'table') return;
   const pageTag = block.type === 'heading' ? `<span class="page-tag">p.${block.page}</span>` : '';
   el.innerHTML = pageTag + renderTextWithMarks(block);
   el.querySelectorAll('mark').forEach(bindMarkTap);
@@ -1277,7 +1500,7 @@ function init() {
   document.getElementById('btnRefreshLib').addEventListener('click', () => { renderLibrary(); toast('새로고침'); });
   document.getElementById('fileInput').addEventListener('change', (e) => {
     const f = e.target.files[0];
-    if (f) importPdfFile(f);
+    if (f) { if (/\.docx$/i.test(f.name)) importDocxFile(f); else importPdfFile(f); }
     e.target.value = '';
   });
   document.getElementById('btnBackLib').addEventListener('click', backToLibrary);
