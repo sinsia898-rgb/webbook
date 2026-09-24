@@ -213,7 +213,7 @@ textarea.note-input{
   <!-- ===================== 라이브러리 ===================== -->
   <section id="screen-library" class="screen active">
     <div class="lib-header">
-      <div class="lib-title">서재<small id="libSub">0권 ·  책장</small></div>
+      <div class="lib-title">서재<small id="libSub">0권 · 둘이 함께 보는 책장</small></div>
       <div style="display:flex; gap:6px;">
         <button class="lib-add" id="btnSetupGear" style="background:var(--bg-elev2); color:var(--ink); font-size:15px;">⚙</button>
         <button class="lib-add" id="btnRefreshLib" style="background:var(--bg-elev2); color:var(--ink); font-size:17px;">⟳</button>
@@ -223,7 +223,7 @@ textarea.note-input{
     <div class="lib-scroll" id="libScroll">
       <div class="lib-empty" id="libEmpty">
         <div class="ico">📖</div>
-        <p>오른쪽 위 ＋ 버튼으로<br>PDF를 추가하면 여기에 책장이 생겨요.<br><span style="font-size:12px">책 목록은 공유돼요 · ⟳로 새로고침</span></p>
+        <p>오른쪽 위 ＋ 버튼으로<br>PDF를 추가하면 여기에 책장이 생겨요.<br><span style="font-size:12px">책 목록은 둘이 공유돼요 · ⟳로 새로고침</span></p>
       </div>
       <div id="libList"></div>
     </div>
@@ -590,7 +590,20 @@ async function importPdfFile(file) {
 
       const strippedForCheck = lineTexts.map(l => l.text).join('').replace(/[\s0-9]/g, '');
 
-      if (strippedForCheck.length < 40) {
+      // 페이지 안에 실제 이미지나 표/도형(선) 그리기 명령이 있는지 확인
+      // → 있으면 텍스트로 뽑지 않고 페이지를 통째로 캡처해서 원본 그대로 보여줌
+      let hasEmbeddedImage = false, vectorOpCount = 0;
+      try {
+        const opList = await page.getOperatorList();
+        const OPS = pdfjsLib.OPS;
+        for (const fn of opList.fnArray) {
+          if (fn === OPS.paintImageXObject || fn === OPS.paintJpegXObject || fn === OPS.paintImageMaskXObject) hasEmbeddedImage = true;
+          else if (fn === OPS.stroke || fn === OPS.fill || fn === OPS.eoFill || fn === OPS.closePath) vectorOpCount++;
+        }
+      } catch (e) { /* 감지 실패 시 텍스트량 기준으로만 판단 */ }
+      const looksLikeTableOrGraphic = vectorOpCount > 6;
+
+      if (strippedForCheck.length < 40 || hasEmbeddedImage || looksLikeTableOrGraphic) {
         const viewport = page.getViewport({ scale: 1.6 });
         const canvas = document.createElement('canvas');
         canvas.width = viewport.width; canvas.height = viewport.height;
