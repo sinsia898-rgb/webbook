@@ -590,20 +590,20 @@ async function importPdfFile(file) {
 
       const strippedForCheck = lineTexts.map(l => l.text).join('').replace(/[\s0-9]/g, '');
 
-      // 페이지 안에 실제 이미지나 표/도형(선) 그리기 명령이 있는지 확인
-      // → 있으면 텍스트로 뽑지 않고 페이지를 통째로 캡처해서 원본 그대로 보여줌
-      let hasEmbeddedImage = false, vectorOpCount = 0;
+      // 페이지 안에 표/도형(선) 그리기 명령이 있는지 확인
+      // → 표가 있으면 텍스트로 뽑지 않고 페이지를 통째로 캡처해서 원본 그대로 보여줌
+      // (사진만 있는 경우는 여기 안 걸림 — 본문은 리플로우 유지, 사진 자체는 생략됨)
+      let vectorOpCount = 0;
       try {
         const opList = await page.getOperatorList();
         const OPS = pdfjsLib.OPS;
         for (const fn of opList.fnArray) {
-          if (fn === OPS.paintImageXObject || fn === OPS.paintJpegXObject || fn === OPS.paintImageMaskXObject) hasEmbeddedImage = true;
-          else if (fn === OPS.stroke || fn === OPS.fill || fn === OPS.eoFill || fn === OPS.closePath) vectorOpCount++;
+          if (fn === OPS.stroke || fn === OPS.fill || fn === OPS.eoFill || fn === OPS.closePath) vectorOpCount++;
         }
       } catch (e) { /* 감지 실패 시 텍스트량 기준으로만 판단 */ }
-      const looksLikeTableOrGraphic = vectorOpCount > 6;
+      const looksLikeTable = vectorOpCount > 6;
 
-      if (strippedForCheck.length < 40 || hasEmbeddedImage || looksLikeTableOrGraphic) {
+      if (strippedForCheck.length < 40 || looksLikeTable) {
         const viewport = page.getViewport({ scale: 1.6 });
         const canvas = document.createElement('canvas');
         canvas.width = viewport.width; canvas.height = viewport.height;
@@ -728,10 +728,18 @@ async function renderLibrary() {
 
   listEl.querySelectorAll('.book-card').forEach(card => {
     let pressTimer;
-    card.addEventListener('click', () => openBook(card.dataset.id));
-    card.addEventListener('touchstart', () => { pressTimer = setTimeout(() => showCtxMenu(card.dataset.id, card), 550); });
-    card.addEventListener('touchend', () => clearTimeout(pressTimer));
-    card.addEventListener('touchmove', () => clearTimeout(pressTimer));
+    let longPressed = false;
+    card.addEventListener('pointerdown', () => {
+      longPressed = false;
+      pressTimer = setTimeout(() => { longPressed = true; showCtxMenu(card.dataset.id, card); }, 500);
+    });
+    card.addEventListener('pointerup', () => clearTimeout(pressTimer));
+    card.addEventListener('pointercancel', () => clearTimeout(pressTimer));
+    card.addEventListener('pointermove', () => clearTimeout(pressTimer));
+    card.addEventListener('click', (e) => {
+      if (longPressed) { longPressed = false; e.preventDefault(); e.stopPropagation(); return; }
+      openBook(card.dataset.id);
+    });
   });
 }
 
